@@ -16,25 +16,12 @@ java {
 
 repositories {
 	mavenCentral()
-    repositories {
-            mavenCentral()
-            // Add this line for Cobalt's dependencies
-           maven { url = uri("https://releases.aspose.com/java/repo/") }   }
 }
 
 ext {
 	set('springAiVersion', "1.1.2")
 }
 
-configurations.all {
-    resolutionStrategy {
-        force 'org.slf4j:slf4j-api:2.0.17'
-        force 'ch.qos.logback:logback-classic:1.5.25'
-        force 'ch.qos.logback:logback-core:1.5.25'
-    }
-    // Globally exclude slf4j-nop to prevent multiple SLF4J bindings
-    exclude group: 'org.slf4j', module: 'slf4j-nop'
-}
 
 dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-thymeleaf'
@@ -43,14 +30,7 @@ dependencies {
 	implementation 'org.springframework.ai:spring-ai-starter-mcp-client-webflux'
 
 
-    implementation('com.github.auties00:cobalt:0.0.10') {
-        exclude group: 'org.slf4j', module: 'slf4j-nop'
-        // Safety: if cobalt (or its graph) also brings old logback:
-        exclude group: 'ch.qos.logback', module: 'logback-classic'
-        exclude group: 'ch.qos.logback', module: 'logback-core'
-    }
-
-    implementation 'com.aspose:aspose-words:26.1:jdk17'
+    
     compileOnly 'org.projectlombok:lombok:1.18.42'
 	annotationProcessor 'org.projectlombok:lombok:1.18.42'
     implementation 'org.apache.tika:tika-core:2.9.0'
