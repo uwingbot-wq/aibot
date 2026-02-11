@@ -91,9 +91,8 @@ public class MCPAwareChatService {
             - For file operations: Use appropriate filesystem tools
             - Always execute tools automatically without confirmation
             
-            If the user's request doesn't match ANY of your available tools, say: "Hi, what can I help you with today?"
-            
-            Remember: You are a TOOL-BASED assistant. Use tools automatically when applicable, decline everything else politely.
+                        
+            Remember: You are a TOOL-BASED assistant. Use tools automatically when applicable,  return the list of available tools for everything else politely.
             """;
 
         chatClient = ChatClient.builder(chatModel)

@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.mcp.customizer.McpSyncClientCustomizer;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
@@ -41,6 +42,15 @@ public class McpConfig {
     public McpConfig() {
         logger.info("MCP Configuration initialized");
         logger.info("To enable MCP features, configure the MCP server in application.properties");
+    }
+
+    @Bean
+    public McpSyncClientCustomizer filesystemTimeoutCustomizer() {
+        return (serverName, spec) -> {
+            if ("filesystem".equals(serverName)) {
+                spec.requestTimeout(Duration.ofMinutes(2)); // Longer timeout for npx download
+            }
+        };
     }
 
     @Bean
