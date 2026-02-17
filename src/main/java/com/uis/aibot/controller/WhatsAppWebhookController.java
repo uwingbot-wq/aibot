@@ -1,7 +1,9 @@
 package com.uis.aibot.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.uis.aibot.service.MCPAwareChatService;
+import com.uis.aibot.dto.ChatQueueMessage;
+import com.uis.aibot.service.ChatMessageProducer;
+import com.uis.aibot.service.WhatsAppDeliveryService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -19,7 +21,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
-import java.util.Map;
 
 @RestController
 @RequestMapping("/webhook")
@@ -28,7 +29,8 @@ public class WhatsAppWebhookController {
     private static final Logger logger = LoggerFactory.getLogger(WhatsAppWebhookController.class);
 
     private final WebClient webClient;
-    private final MCPAwareChatService chatService;
+    private final ChatMessageProducer messageProducer;
+    private final WhatsAppDeliveryService whatsAppDeliveryService;
 
     @Value("${whatsapp.verify.token}")
     private String verifyToken;
@@ -42,9 +44,12 @@ public class WhatsAppWebhookController {
     @Value("${upload.dir:uploads}")
     private String uploadDir;
 
-    public WhatsAppWebhookController(WebClient.Builder builder, MCPAwareChatService chatService) {
+    public WhatsAppWebhookController(WebClient.Builder builder,
+                                      ChatMessageProducer messageProducer,
+                                      WhatsAppDeliveryService whatsAppDeliveryService) {
         this.webClient = builder.build();
-        this.chatService = chatService;
+        this.messageProducer = messageProducer;
+        this.whatsAppDeliveryService = whatsAppDeliveryService;
     }
 
     // =============================
@@ -80,7 +85,7 @@ public class WhatsAppWebhookController {
             return Mono.just("Test endpoint ready. Add ?phone=1234567890 to send a test message");
         }
 
-        return sendWhatsAppMessage(phone, "Test message from aibot 🤖")
+        return whatsAppDeliveryService.sendMessage(phone, "Test message from aibot 🤖")
                 .thenReturn("✅ Test message sent to " + phone)
                 .onErrorResume(e -> Mono.just("❌ Failed to send test message: " + e.getMessage()));
     }
@@ -126,14 +131,12 @@ public class WhatsAppWebhookController {
         String text = messageNode.path("text").path("body").asText();
         logger.info("💬 Text message: {}", text);
 
-        return chatService.chat(from, text)
-                .flatMap(reply -> sendWhatsAppMessage(from, reply))
-                .thenReturn("EVENT_RECEIVED")
-                .onErrorResume(e -> {
-                    logger.error("❌ Error handling text message: {}", e.getMessage(), e);
-                    return sendWhatsAppMessage(from, "Sorry, I encountered an error processing your message.")
-                            .thenReturn("EVENT_RECEIVED");
-                });
+        // Create normalized message and enqueue for async processing
+        ChatQueueMessage queueMessage = ChatQueueMessage.forWhatsAppText(from, text);
+        messageProducer.sendMessage(queueMessage);
+
+        logger.info("📤 Text message enqueued for processing: {}", queueMessage.getMessageId());
+        return Mono.just("EVENT_RECEIVED");
     }
 
     // =============================
@@ -150,23 +153,17 @@ public class WhatsAppWebhookController {
                 .flatMap(filePath -> {
                     logger.info("📁 Image saved to: {}", filePath);
 
-                    if (caption.isEmpty()) {
-                        // No caption: just add upload message to history
-                        String uploadMessage = "upload file to filepath: " + filePath;
-                        chatService.getHistory(from).add(new MCPAwareChatService.ChatMessage("user", uploadMessage));
-                        logger.info("📝 Added to history: {}", uploadMessage);
-                        return Mono.just("EVENT_RECEIVED");
-                    } else {
-                        // Has caption: send to chat service with file path
-                        return chatService.chat(from, caption, mimeType, filePath)
-                                .flatMap(reply -> sendWhatsAppMessage(from, reply))
-                                .thenReturn("EVENT_RECEIVED");
-                    }
+                    // Create normalized message and enqueue for async processing
+                    ChatQueueMessage queueMessage = ChatQueueMessage.forWhatsAppImage(
+                            from, caption, filePath, mimeType);
+                    messageProducer.sendMessage(queueMessage);
+
+                    logger.info("📤 Image message enqueued for processing: {}", queueMessage.getMessageId());
+                    return Mono.just("EVENT_RECEIVED");
                 })
                 .onErrorResume(e -> {
                     logger.error("❌ Error handling image: {}", e.getMessage(), e);
-                    return sendWhatsAppMessage(from, "Sorry, I couldn't process your image.")
-                            .thenReturn("EVENT_RECEIVED");
+                    return Mono.just("EVENT_RECEIVED");
                 });
     }
 
@@ -180,29 +177,23 @@ public class WhatsAppWebhookController {
         String caption = messageNode.path("document").path("caption").asText("");
 
         logger.info("📄 Document received - ID: {}, MIME: {}, Filename: {}, Caption: '{}'",
-                    mediaId, mimeType, filename, caption);
+                mediaId, mimeType, filename, caption);
 
         return downloadMedia(mediaId, mimeType)
                 .flatMap(filePath -> {
                     logger.info("📁 Document saved to: {}", filePath);
 
-                    if (caption.isEmpty()) {
-                        // No caption: just add upload message to history
-                        String uploadMessage = "upload file to filepath: " + filePath;
-                        chatService.getHistory(from).add(new MCPAwareChatService.ChatMessage("user", uploadMessage));
-                        logger.info("📝 Added to history: {}", uploadMessage);
-                        return Mono.just("EVENT_RECEIVED");
-                    } else {
-                        // Has caption: send to chat service with file path
-                        return chatService.chat(from, caption, mimeType, filePath)
-                                .flatMap(reply -> sendWhatsAppMessage(from, reply))
-                                .thenReturn("EVENT_RECEIVED");
-                    }
+                    // Create normalized message and enqueue for async processing
+                    ChatQueueMessage queueMessage = ChatQueueMessage.forWhatsAppDocument(
+                            from, caption, filePath, mimeType, filename);
+                    messageProducer.sendMessage(queueMessage);
+
+                    logger.info("📤 Document message enqueued for processing: {}", queueMessage.getMessageId());
+                    return Mono.just("EVENT_RECEIVED");
                 })
                 .onErrorResume(e -> {
                     logger.error("❌ Error handling document: {}", e.getMessage(), e);
-                    return sendWhatsAppMessage(from, "Sorry, I couldn't process your document.")
-                            .thenReturn("EVENT_RECEIVED");
+                    return Mono.just("EVENT_RECEIVED");
                 });
     }
 
@@ -230,29 +221,29 @@ public class WhatsAppWebhookController {
                             .bodyToFlux(DataBuffer.class)
                             .collectList()
                             .flatMap(dataBuffers ->
-                                Mono.fromCallable(() -> {
-                                    // Create upload directory if it doesn't exist
-                                    Path uploadPath = Paths.get(uploadDir);
-                                    Files.createDirectories(uploadPath);
+                                    Mono.fromCallable(() -> {
+                                        // Create upload directory if it doesn't exist
+                                        Path uploadPath = Paths.get(uploadDir);
+                                        Files.createDirectories(uploadPath);
 
-                                    // Generate filename with extension from MIME type
-                                    String extension = getFileExtension(mimeType);
-                                    String filename = mediaId + extension;
-                                    Path filePath = uploadPath.resolve(filename);
+                                        // Generate filename with extension from MIME type
+                                        String extension = getFileExtension(mimeType);
+                                        String filename = mediaId + extension;
+                                        Path filePath = uploadPath.resolve(filename);
 
-                                    logger.debug("💾 Saving file to: {}", filePath);
-                                    return filePath;
-                                }).flatMap(filePath ->
-                                    // Write file using reactive DataBuffer
-                                    DataBufferUtils.write(
-                                            Flux.fromIterable(dataBuffers),
-                                            filePath,
-                                            StandardOpenOption.CREATE,
-                                            StandardOpenOption.TRUNCATE_EXISTING
+                                        logger.debug("💾 Saving file to: {}", filePath);
+                                        return filePath;
+                                    }).flatMap(filePath ->
+                                            // Write file using reactive DataBuffer
+                                            DataBufferUtils.write(
+                                                    Flux.fromIterable(dataBuffers),
+                                                    filePath,
+                                                    StandardOpenOption.CREATE,
+                                                    StandardOpenOption.TRUNCATE_EXISTING
+                                            )
+                                                    .then(Mono.just(filePath.toString()))
+                                                    .doOnSuccess(path -> logger.info("✅ File saved successfully: {}", path))
                                     )
-                                    .then(Mono.just(filePath.toString()))
-                                    .doOnSuccess(path -> logger.info("✅ File saved successfully: {}", path))
-                                )
                             );
                 });
     }
@@ -278,49 +269,5 @@ public class WhatsAppWebhookController {
             case "video/mp4" -> ".mp4";
             default -> "";
         };
-    }
-
-    // =============================
-    // 4️⃣ Send Message Back to WhatsApp
-    // =============================
-    private Mono<Void> sendWhatsAppMessage(String to, String text) {
-        if (to == null || to.isEmpty()) {
-            logger.error("❌ Cannot send message: 'to' is null or empty");
-            return Mono.error(new IllegalArgumentException("Recipient phone number is required"));
-        }
-
-        if (text == null || text.isEmpty()) {
-            logger.error("❌ Cannot send message: 'text' is null or empty");
-            return Mono.error(new IllegalArgumentException("Message text is required"));
-        }
-
-        logger.debug("📤 Sending message to {}: {}", to, text.substring(0, Math.min(text.length(), 50)) + "...");
-
-        Map<String, Object> requestBody = Map.of(
-                "messaging_product", "whatsapp",
-                "to", to,
-                "type", "text",
-                "text", Map.of("body", text)
-        );
-
-        logger.debug("📋 Request body: {}", requestBody);
-        logger.debug("🔑 Using phone number ID: {}", phoneNumberId);
-        logger.debug("🔐 Access token length: {}", accessToken != null ? accessToken.length() : 0);
-
-        return webClient.post()
-                .uri("https://graph.facebook.com/v19.0/" + phoneNumberId + "/messages")
-                .header("Authorization", "Bearer " + accessToken)
-                .header("Content-Type", "application/json")
-                .bodyValue(requestBody)
-                .retrieve()
-                .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
-                        response -> response.bodyToMono(String.class)
-                                .flatMap(errorBody -> {
-                                    logger.error("❌ WhatsApp API error response: {}", errorBody);
-                                    return Mono.error(new RuntimeException("WhatsApp API error: " + errorBody));
-                                }))
-                .bodyToMono(Void.class)
-                .doOnSuccess(v -> logger.info("✅ Message sent successfully to {}", to))
-                .doOnError(e -> logger.error("❌ Failed to send message to {}: {}", to, e.getMessage()));
     }
 }

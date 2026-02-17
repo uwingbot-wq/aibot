@@ -190,10 +190,26 @@ public class MCPAwareChatService {
     }
 
     /**
-     * Get conversation history for a session
+     * Get conversation history for a session (returns a copy)
      */
     public List<ChatMessage> getHistory(String sessionId) {
         return new ArrayList<>(conversationHistory.getOrDefault(sessionId, new ArrayList<>()));
+    }
+
+    /**
+     * Add a message to the conversation history for a session
+     */
+    public void addToHistory(String sessionId, ChatMessage message) {
+        List<ChatMessage> history = conversationHistory.computeIfAbsent(
+            sessionId,
+            k -> new ArrayList<>()
+        );
+        history.add(message);
+        // Keep history manageable
+        if (history.size() > 20) {
+            history.subList(0, history.size() - 20).clear();
+        }
+        logger.debug("Added message to history for session: {} (history size: {})", sessionId, history.size());
     }
 
 
