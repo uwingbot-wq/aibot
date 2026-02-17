@@ -29,8 +29,6 @@ dependencies {
 	implementation 'io.github.wimdeblauwe:htmx-spring-boot-thymeleaf:5.0.0'
 	implementation 'org.springframework.ai:spring-ai-starter-mcp-client-webflux'
 
-
-    
     compileOnly 'org.projectlombok:lombok:1.18.42'
 	annotationProcessor 'org.projectlombok:lombok:1.18.42'
     implementation 'org.apache.tika:tika-core:2.9.0'

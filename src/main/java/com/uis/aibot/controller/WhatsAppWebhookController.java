@@ -1,21 +1,34 @@
 package com.uis.aibot.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.uis.aibot.service.MCPAwareChatService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.HttpStatus;
 
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.server.ResponseStatusException;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.Map;
 
 @RestController
 @RequestMapping("/webhook")
 public class WhatsAppWebhookController {
 
+    private static final Logger logger = LoggerFactory.getLogger(WhatsAppWebhookController.class);
+
     private final WebClient webClient;
+    private final MCPAwareChatService chatService;
 
     @Value("${whatsapp.verify.token}")
     private String verifyToken;
@@ -26,12 +39,16 @@ public class WhatsAppWebhookController {
     @Value("${whatsapp.phone.number.id}")
     private String phoneNumberId;
 
-    public WhatsAppWebhookController(WebClient.Builder builder) {
+    @Value("${upload.dir:uploads}")
+    private String uploadDir;
+
+    public WhatsAppWebhookController(WebClient.Builder builder, MCPAwareChatService chatService) {
         this.webClient = builder.build();
+        this.chatService = chatService;
     }
 
     // =============================
-    // 1️⃣ Verification Endpoint
+    // 1️⃣ Verification Endpoint (GET /webhook)
     // =============================
     @GetMapping
     public String verify(
@@ -39,18 +56,41 @@ public class WhatsAppWebhookController {
             @RequestParam("hub.verify_token") String token,
             @RequestParam("hub.challenge") String challenge) {
 
+        logger.info("🔐 Verification request - mode: {}, token match: {}", mode, verifyToken.equals(token));
+
         if ("subscribe".equals(mode) && verifyToken.equals(token)) {
+            logger.info("✅ Verification successful");
             return challenge;
         }
 
+        logger.warn("❌ Verification failed - mode: {}, token match: {}", mode, verifyToken.equals(token));
         throw new ResponseStatusException(HttpStatus.FORBIDDEN);
     }
 
     // =============================
-    // 2️⃣ Receive Incoming Messages
+    // 🧪 Test Endpoint (GET /webhook/test)
+    // =============================
+    @GetMapping("/test")
+    public Mono<String> testWhatsAppConnection(@RequestParam(required = false) String phone) {
+        logger.info("🧪 Testing WhatsApp API connection");
+        logger.info("📋 Phone Number ID: {}", phoneNumberId);
+        logger.info("🔐 Access Token configured: {}", accessToken != null && !accessToken.isEmpty());
+
+        if (phone == null || phone.isEmpty()) {
+            return Mono.just("Test endpoint ready. Add ?phone=1234567890 to send a test message");
+        }
+
+        return sendWhatsAppMessage(phone, "Test message from aibot 🤖")
+                .thenReturn("✅ Test message sent to " + phone)
+                .onErrorResume(e -> Mono.just("❌ Failed to send test message: " + e.getMessage()));
+    }
+
+    // =============================
+    // 2️⃣ Receive Incoming Messages (POST /webhook)
     // =============================
     @PostMapping
     public Mono<String> receive(@RequestBody JsonNode payload) {
+        logger.debug("📥 Received webhook payload: {}", payload.toPrettyString());
 
         JsonNode messageNode = payload
                 .path("entry").get(0)
@@ -59,49 +99,228 @@ public class WhatsAppWebhookController {
                 .path("messages").get(0);
 
         if (messageNode == null || messageNode.isMissingNode()) {
+            logger.debug("No message found in payload, returning EVENT_RECEIVED");
             return Mono.just("EVENT_RECEIVED");
         }
 
         String from = messageNode.path("from").asText();
-        String text = messageNode.path("text").path("body").asText();
+        String messageType = messageNode.path("type").asText();
 
-        return generateAIResponse(text)
-                .flatMap(reply -> sendWhatsAppMessage(from, reply))
-                .thenReturn("EVENT_RECEIVED");
+        logger.info("📨 Received {} message from {}", messageType, from);
+
+        return switch (messageType) {
+            case "text" -> handleTextMessage(messageNode, from);
+            case "image" -> handleImageMessage(messageNode, from);
+            case "document" -> handleDocumentMessage(messageNode, from);
+            default -> {
+                logger.warn("⚠️ Unsupported message type: {}", messageType);
+                yield Mono.just("EVENT_RECEIVED");
+            }
+        };
     }
 
     // =============================
-    // 3️⃣ Call Ollama
+    // Handle Text Messages
     // =============================
-    private Mono<String> generateAIResponse(String prompt) {
+    private Mono<String> handleTextMessage(JsonNode messageNode, String from) {
+        String text = messageNode.path("text").path("body").asText();
+        logger.info("💬 Text message: {}", text);
 
-        return webClient.post()
-                .uri("http://localhost:11434/api/generate")
-                .bodyValue(Map.of(
-                        "model", "llama3.1:latest",
-                        "prompt", prompt,
-                        "stream", false
-                ))
+        return chatService.chat(from, text)
+                .flatMap(reply -> sendWhatsAppMessage(from, reply))
+                .thenReturn("EVENT_RECEIVED")
+                .onErrorResume(e -> {
+                    logger.error("❌ Error handling text message: {}", e.getMessage(), e);
+                    return sendWhatsAppMessage(from, "Sorry, I encountered an error processing your message.")
+                            .thenReturn("EVENT_RECEIVED");
+                });
+    }
+
+    // =============================
+    // Handle Image Messages
+    // =============================
+    private Mono<String> handleImageMessage(JsonNode messageNode, String from) {
+        String mediaId = messageNode.path("image").path("id").asText();
+        String mimeType = messageNode.path("image").path("mime_type").asText();
+        String caption = messageNode.path("image").path("caption").asText("");
+
+        logger.info("🖼️ Image received - ID: {}, MIME: {}, Caption: '{}'", mediaId, mimeType, caption);
+
+        return downloadMedia(mediaId, mimeType)
+                .flatMap(filePath -> {
+                    logger.info("📁 Image saved to: {}", filePath);
+
+                    if (caption.isEmpty()) {
+                        // No caption: just add upload message to history
+                        String uploadMessage = "upload file to filepath: " + filePath;
+                        chatService.getHistory(from).add(new MCPAwareChatService.ChatMessage("user", uploadMessage));
+                        logger.info("📝 Added to history: {}", uploadMessage);
+                        return Mono.just("EVENT_RECEIVED");
+                    } else {
+                        // Has caption: send to chat service with file path
+                        return chatService.chat(from, caption, mimeType, filePath)
+                                .flatMap(reply -> sendWhatsAppMessage(from, reply))
+                                .thenReturn("EVENT_RECEIVED");
+                    }
+                })
+                .onErrorResume(e -> {
+                    logger.error("❌ Error handling image: {}", e.getMessage(), e);
+                    return sendWhatsAppMessage(from, "Sorry, I couldn't process your image.")
+                            .thenReturn("EVENT_RECEIVED");
+                });
+    }
+
+    // =============================
+    // Handle Document Messages
+    // =============================
+    private Mono<String> handleDocumentMessage(JsonNode messageNode, String from) {
+        String mediaId = messageNode.path("document").path("id").asText();
+        String mimeType = messageNode.path("document").path("mime_type").asText();
+        String filename = messageNode.path("document").path("filename").asText("");
+        String caption = messageNode.path("document").path("caption").asText("");
+
+        logger.info("📄 Document received - ID: {}, MIME: {}, Filename: {}, Caption: '{}'",
+                    mediaId, mimeType, filename, caption);
+
+        return downloadMedia(mediaId, mimeType)
+                .flatMap(filePath -> {
+                    logger.info("📁 Document saved to: {}", filePath);
+
+                    if (caption.isEmpty()) {
+                        // No caption: just add upload message to history
+                        String uploadMessage = "upload file to filepath: " + filePath;
+                        chatService.getHistory(from).add(new MCPAwareChatService.ChatMessage("user", uploadMessage));
+                        logger.info("📝 Added to history: {}", uploadMessage);
+                        return Mono.just("EVENT_RECEIVED");
+                    } else {
+                        // Has caption: send to chat service with file path
+                        return chatService.chat(from, caption, mimeType, filePath)
+                                .flatMap(reply -> sendWhatsAppMessage(from, reply))
+                                .thenReturn("EVENT_RECEIVED");
+                    }
+                })
+                .onErrorResume(e -> {
+                    logger.error("❌ Error handling document: {}", e.getMessage(), e);
+                    return sendWhatsAppMessage(from, "Sorry, I couldn't process your document.")
+                            .thenReturn("EVENT_RECEIVED");
+                });
+    }
+
+    // =============================
+    // Download Media from WhatsApp
+    // =============================
+    private Mono<String> downloadMedia(String mediaId, String mimeType) {
+        logger.debug("⬇️ Downloading media ID: {}", mediaId);
+
+        // Step 1: Get media URL from WhatsApp API
+        return webClient.get()
+                .uri("https://graph.facebook.com/v19.0/" + mediaId)
+                .header("Authorization", "Bearer " + accessToken)
                 .retrieve()
                 .bodyToMono(JsonNode.class)
-                .map(json -> json.path("response").asText());
+                .flatMap(response -> {
+                    String mediaUrl = response.path("url").asText();
+                    logger.debug("📍 Media URL: {}", mediaUrl);
+
+                    // Step 2: Download the actual file
+                    return webClient.get()
+                            .uri(mediaUrl)
+                            .header("Authorization", "Bearer " + accessToken)
+                            .retrieve()
+                            .bodyToFlux(DataBuffer.class)
+                            .collectList()
+                            .flatMap(dataBuffers ->
+                                Mono.fromCallable(() -> {
+                                    // Create upload directory if it doesn't exist
+                                    Path uploadPath = Paths.get(uploadDir);
+                                    Files.createDirectories(uploadPath);
+
+                                    // Generate filename with extension from MIME type
+                                    String extension = getFileExtension(mimeType);
+                                    String filename = mediaId + extension;
+                                    Path filePath = uploadPath.resolve(filename);
+
+                                    logger.debug("💾 Saving file to: {}", filePath);
+                                    return filePath;
+                                }).flatMap(filePath ->
+                                    // Write file using reactive DataBuffer
+                                    DataBufferUtils.write(
+                                            Flux.fromIterable(dataBuffers),
+                                            filePath,
+                                            StandardOpenOption.CREATE,
+                                            StandardOpenOption.TRUNCATE_EXISTING
+                                    )
+                                    .then(Mono.just(filePath.toString()))
+                                    .doOnSuccess(path -> logger.info("✅ File saved successfully: {}", path))
+                                )
+                            );
+                });
+    }
+
+    // =============================
+    // Get File Extension from MIME Type
+    // =============================
+    private String getFileExtension(String mimeType) {
+        return switch (mimeType) {
+            case "image/jpeg" -> ".jpg";
+            case "image/png" -> ".png";
+            case "image/webp" -> ".webp";
+            case "image/gif" -> ".gif";
+            case "application/pdf" -> ".pdf";
+            case "application/vnd.ms-powerpoint" -> ".ppt";
+            case "application/msword" -> ".doc";
+            case "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> ".docx";
+            case "application/vnd.openxmlformats-officedocument.presentationml.presentation" -> ".pptx";
+            case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" -> ".xlsx";
+            case "text/plain" -> ".txt";
+            case "audio/ogg" -> ".ogg";
+            case "audio/mpeg" -> ".mp3";
+            case "video/mp4" -> ".mp4";
+            default -> "";
+        };
     }
 
     // =============================
     // 4️⃣ Send Message Back to WhatsApp
     // =============================
     private Mono<Void> sendWhatsAppMessage(String to, String text) {
+        if (to == null || to.isEmpty()) {
+            logger.error("❌ Cannot send message: 'to' is null or empty");
+            return Mono.error(new IllegalArgumentException("Recipient phone number is required"));
+        }
+
+        if (text == null || text.isEmpty()) {
+            logger.error("❌ Cannot send message: 'text' is null or empty");
+            return Mono.error(new IllegalArgumentException("Message text is required"));
+        }
+
+        logger.debug("📤 Sending message to {}: {}", to, text.substring(0, Math.min(text.length(), 50)) + "...");
+
+        Map<String, Object> requestBody = Map.of(
+                "messaging_product", "whatsapp",
+                "to", to,
+                "type", "text",
+                "text", Map.of("body", text)
+        );
+
+        logger.debug("📋 Request body: {}", requestBody);
+        logger.debug("🔑 Using phone number ID: {}", phoneNumberId);
+        logger.debug("🔐 Access token length: {}", accessToken != null ? accessToken.length() : 0);
 
         return webClient.post()
                 .uri("https://graph.facebook.com/v19.0/" + phoneNumberId + "/messages")
                 .header("Authorization", "Bearer " + accessToken)
-                .bodyValue(Map.of(
-                        "messaging_product", "whatsapp",
-                        "to", to,
-                        "type", "text",
-                        "text", Map.of("body", text)
-                ))
+                .header("Content-Type", "application/json")
+                .bodyValue(requestBody)
                 .retrieve()
-                .bodyToMono(Void.class);
+                .onStatus(status -> status.is4xxClientError() || status.is5xxServerError(),
+                        response -> response.bodyToMono(String.class)
+                                .flatMap(errorBody -> {
+                                    logger.error("❌ WhatsApp API error response: {}", errorBody);
+                                    return Mono.error(new RuntimeException("WhatsApp API error: " + errorBody));
+                                }))
+                .bodyToMono(Void.class)
+                .doOnSuccess(v -> logger.info("✅ Message sent successfully to {}", to))
+                .doOnError(e -> logger.error("❌ Failed to send message to {}: {}", to, e.getMessage()));
     }
 }
